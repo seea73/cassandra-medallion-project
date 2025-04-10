@@ -1,0 +1,405 @@
+
+
+print("\nAvailable keyspaces in your Astra DB:")
+keyspaces = session.execute("SELECT keyspace_name FROM system_schema.keyspaces")
+for keyspace in keyspaces:
+    print(f"- {keyspace.keyspace_name}")
+
+# Ask user to choose a keyspace from the available ones
+print("\nPlease enter the name of your keyspace to use:")
+keyspace_name = input()
+
+# Use the selected keyspace
+session.set_keyspace(keyspace_name)
+print(f"Connected to keyspace {keyspace_name}")
+
+
+# Step 5: Create Bronze Level Table (Raw Data)
+print("\nCreating Bronze level table...")
+bronze_table_name = 'bronze_sales'
+
+# Check data types from the DataFrame to create appropriate CQL types
+column_types = {}
+for column in sales_df.columns:
+    if sales_df[column].dtype == 'int64':
+        column_types[column] = 'int'
+    elif sales_df[column].dtype == 'float64':
+        column_types[column] = 'double'
+    else:
+        column_types[column] = 'text'
+
+# Drop table if exists (for clean development)
+session.execute(f"DROP TABLE IF EXISTS {bronze_table_name}")
+
+# Create the Bronze table
+create_bronze_table_query = f"""
+CREATE TABLE IF NOT EXISTS {bronze_table_name} (
+    id uuid PRIMARY KEY,
+    ingestion_time timestamp,
+    """
+
+for col, col_type in column_types.items():
+    # Replace spaces in column names with underscores and make lowercase
+    col_cql = col.replace(' ', '_').lower()
+    create_bronze_table_query += f"{col_cql} {col_type},\n    "
+
+# Remove trailing comma and newline, then close the query
+create_bronze_table_query = create_bronze_table_query[:-6] + "\n)"
+
+# Execute the create table query
+session.execute(create_bronze_table_query)
+print(f"Created Bronze table: {bronze_table_name}")
+
+# Prepare batch statements for Bronze table
+print("Loading data into Bronze table...")
+for _, row in sales_df.iterrows():
+    # Create unique ID for this record
+    record_id = uuid.uuid4()
+    
+    # Build the insert query
+    columns = ['id', 'ingestion_time']
+    values = [str(record_id), 'toTimestamp(now())']
+    
+    for col in sales_df.columns:
+        # Clean column name for CQL
+        col_cql = col.replace(' ', '_').lower()
+        columns.append(col_cql)
+        
+        # Format value based on type
+        if pd.isna(row[col]):
+            values.append('null')
+        elif isinstance(row[col], (int, float)):
+            values.append(str(row[col]))
+        else:
+            escaped = str(row[col]).replace("'", "''")
+            values.append(f"'{escaped}'")
+            
+    insert_query = f"""
+    INSERT INTO {bronze_table_name} ({', '.join(columns)})
+    VALUES ({', '.join(values)})
+    """
+    session.execute(insert_query)
+
+print(f"Data loaded into Bronze table: {bronze_table_name}")
+
+# Step 6: Create Silver Level Table (Cleaned Data)
+print("\nCreating Silver level table...")
+silver_table_name = 'silver_sales'
+
+# Drop table if exists (for clean development)
+session.execute(f"DROP TABLE IF EXISTS {silver_table_name}")
+
+# Define the create table query for Silver layer
+create_silver_table_query = f"""
+CREATE TABLE IF NOT EXISTS {silver_table_name} (
+    id uuid PRIMARY KEY,
+    processing_time timestamp,
+    order_date date,
+    region text,
+    country text,
+    item_type text,
+    sales_channel text,
+    order_priority text,
+    order_id text,
+    ship_date date,
+    units_sold int,
+    unit_price double,
+    unit_cost double,
+    total_revenue double,
+    total_cost double,
+    total_profit double
+)
+"""
+
+# Execute the create table query
+session.execute(create_silver_table_query)
+print(f"Created Silver table: {silver_table_name}")
+
+# Get data from Bronze table to process
+rows = session.execute(f"SELECT * FROM {bronze_table_name}")
+
+# Process and insert data into Silver table
+print("Processing data for Silver table...")
+for row in rows:
+    try:
+        # Handle date conversions - assuming dates are in format MM/DD/YYYY
+        if hasattr(row, 'order_date') and row.order_date:
+            date_parts = row.order_date.split('/')
+            if len(date_parts) == 3:
+                month, day, year = date_parts
+                order_date = f"'{year}-{month.zfill(2)}-{day.zfill(2)}'"
+            else:
+                order_date = 'null'
+        else:
+            order_date = 'null'
+        
+        if hasattr(row, 'ship_date') and row.ship_date:
+            date_parts = row.ship_date.split('/')
+            if len(date_parts) == 3:
+                month, day, year = date_parts
+                ship_date = f"'{year}-{month.zfill(2)}-{day.zfill(2)}'"
+            else:
+                ship_date = 'null'
+        else:
+            ship_date = 'null'
+        
+        # Ensure numeric values are proper
+        units_sold = row.units_sold if hasattr(row, 'units_sold') and row.units_sold is not None else 0
+        unit_price = row.unit_price if hasattr(row, 'unit_price') and row.unit_price is not None else 0.0
+        unit_cost = row.unit_cost if hasattr(row, 'unit_cost') and row.unit_cost is not None else 0.0
+        
+        # Calculate derived fields
+        total_revenue = units_sold * unit_price
+        total_cost = units_sold * unit_cost
+        total_profit = total_revenue - total_cost
+        
+        # Insert into Silver table
+        insert_query = f"""
+        INSERT INTO {silver_table_name} (
+            id, processing_time, order_date, region, country, item_type, 
+            sales_channel, order_priority, order_id, ship_date, 
+            units_sold, unit_price, unit_cost, total_revenue, total_cost, total_profit
+        )
+        VALUES (
+            {row.id}, toTimestamp(now()), {order_date}, 
+            '{row.region if hasattr(row, 'region') and row.region else "Unknown"}', 
+            '{row.country if hasattr(row, 'country') and row.country else "Unknown"}', 
+            '{row.item_type if hasattr(row, 'item_type') and row.item_type else "Unknown"}', 
+            '{row.sales_channel if hasattr(row, 'sales_channel') and row.sales_channel else "Unknown"}', 
+            '{row.order_priority if hasattr(row, 'order_priority') and row.order_priority else "Unknown"}', 
+            '{row.order_id if hasattr(row, 'order_id') and row.order_id else "Unknown"}', 
+            {ship_date}, {units_sold}, {unit_price}, {unit_cost}, 
+            {total_revenue}, {total_cost}, {total_profit}
+        )
+        """
+        session.execute(insert_query)
+    except Exception as e:
+        print(f"Error processing row: {e}")
+
+print(f"Data processed and loaded into Silver table: {silver_table_name}")
+
+# Step 7: Create Gold Level Tables (Business Views)
+print("\nCreating Gold level tables...")
+
+# Gold Table 1: Sales by Region
+gold_region_table = 'gold_sales_by_region'
+
+# Drop table if exists (for clean development)
+session.execute(f"DROP TABLE IF EXISTS {gold_region_table}")
+
+create_gold_region_query = f"""
+CREATE TABLE IF NOT EXISTS {gold_region_table} (
+    region text,
+    report_date date,
+    total_orders int,
+    total_revenue double,
+    total_profit double,
+    avg_order_value double,
+    PRIMARY KEY (region, report_date)
+)
+"""
+
+session.execute(create_gold_region_query)
+print(f"Created Gold table: {gold_region_table}")
+
+# Aggregate data by region and load into Gold table
+print("Processing data for Gold Sales by Region table...")
+try:
+    # In Cassandra, we can't directly do this aggregation in CQL, so we'll fetch and process in Python
+    silver_data = session.execute(f"SELECT * FROM {silver_table_name}")
+    
+    # Process data in Python
+    region_aggregations = {}
+    for row in silver_data:
+        region = row.region
+        if region not in region_aggregations:
+            region_aggregations[region] = {
+                'total_orders': 0,
+                'total_revenue': 0,
+                'total_profit': 0
+            }
+        
+        region_aggregations[region]['total_orders'] += 1
+        region_aggregations[region]['total_revenue'] += row.total_revenue
+        region_aggregations[region]['total_profit'] += row.total_profit
+    
+    # Insert aggregated data
+    for region, data in region_aggregations.items():
+        avg_order_value = data['total_revenue'] / data['total_orders'] if data['total_orders'] > 0 else 0
+        
+        insert_query = f"""
+        INSERT INTO {gold_region_table} (
+            region, report_date, total_orders, 
+            total_revenue, total_profit, avg_order_value
+        )
+        VALUES (
+            '{region}', toDate(now()), {data['total_orders']}, 
+            {data['total_revenue']}, {data['total_profit']}, {avg_order_value}
+        )
+        """
+        session.execute(insert_query)
+    
+    print(f"Aggregated data loaded into Gold table: {gold_region_table}")
+except Exception as e:
+    print(f"Error aggregating by region: {e}")
+
+# Gold Table 2: Sales by Item Type
+gold_item_table = 'gold_sales_by_item_type'
+
+# Drop table if exists (for clean development)
+session.execute(f"DROP TABLE IF EXISTS {gold_item_table}")
+
+create_gold_item_query = f"""
+CREATE TABLE IF NOT EXISTS {gold_item_table} (
+    item_type text,
+    report_date date,
+    total_units_sold int,
+    total_revenue double,
+    total_profit double,
+    profit_margin double,
+    PRIMARY KEY (item_type, report_date)
+)
+"""
+
+session.execute(create_gold_item_query)
+print(f"Created Gold table: {gold_item_table}")
+
+# Process and aggregate data by item_type
+print("Processing data for Gold Sales by Item Type table...")
+try:
+    silver_data = session.execute(f"SELECT * FROM {silver_table_name}")
+    
+    item_aggregations = {}
+    for row in silver_data:
+        item_type = row.item_type
+        if item_type not in item_aggregations:
+            item_aggregations[item_type] = {
+                'total_units_sold': 0,
+                'total_revenue': 0,
+                'total_profit': 0
+            }
+        
+        item_aggregations[item_type]['total_units_sold'] += row.units_sold
+        item_aggregations[item_type]['total_revenue'] += row.total_revenue
+        item_aggregations[item_type]['total_profit'] += row.total_profit
+    
+    # Insert aggregated data
+    for item_type, data in item_aggregations.items():
+        profit_margin = (data['total_profit'] / data['total_revenue'] * 100) if data['total_revenue'] > 0 else 0
+        
+        insert_query = f"""
+        INSERT INTO {gold_item_table} (
+            item_type, report_date, total_units_sold, 
+            total_revenue, total_profit, profit_margin
+        )
+        VALUES (
+            '{item_type}', toDate(now()), {data['total_units_sold']}, 
+            {data['total_revenue']}, {data['total_profit']}, {profit_margin}
+        )
+        """
+        session.execute(insert_query)
+    
+    print(f"Aggregated data loaded into Gold table: {gold_item_table}")
+except Exception as e:
+    print(f"Error aggregating by item_type: {e}")
+
+# Gold Table 3: Sales Performance by Sales Channel
+gold_channel_table = 'gold_sales_by_channel'
+
+# Drop table if exists (for clean development)
+session.execute(f"DROP TABLE IF EXISTS {gold_channel_table}")
+
+create_gold_channel_query = f"""
+CREATE TABLE IF NOT EXISTS {gold_channel_table} (
+    sales_channel text,
+    report_date date,
+    total_orders int,
+    total_revenue double,
+    total_profit double,
+    avg_order_priority text,
+    PRIMARY KEY (sales_channel, report_date)
+)
+"""
+
+session.execute(create_gold_channel_query)
+print(f"Created Gold table: {gold_channel_table}")
+
+# Process and aggregate data by sales_channel
+print("Processing data for Gold Sales by Channel table...")
+try:
+    silver_data = session.execute(f"SELECT * FROM {silver_table_name}")
+    
+    channel_aggregations = {}
+    priority_counts = {}
+    
+    for row in silver_data:
+        channel = row.sales_channel
+        if channel not in channel_aggregations:
+            channel_aggregations[channel] = {
+                'total_orders': 0,
+                'total_revenue': 0,
+                'total_profit': 0
+            }
+            priority_counts[channel] = {}
+        
+        channel_aggregations[channel]['total_orders'] += 1
+        channel_aggregations[channel]['total_revenue'] += row.total_revenue
+        channel_aggregations[channel]['total_profit'] += row.total_profit
+        
+        # Track order priorities
+        priority = row.order_priority
+        if priority not in priority_counts[channel]:
+            priority_counts[channel][priority] = 0
+        priority_counts[channel][priority] += 1
+    
+    # Insert aggregated data
+    for channel, data in channel_aggregations.items():
+        # Find most common priority
+        max_priority = None
+        max_count = 0
+        for priority, count in priority_counts[channel].items():
+            if count > max_count:
+                max_count = count
+                max_priority = priority
+        
+        insert_query = f"""
+        INSERT INTO {gold_channel_table} (
+            sales_channel, report_date, total_orders, 
+            total_revenue, total_profit, avg_order_priority
+        )
+        VALUES (
+            '{channel}', toDate(now()), {data['total_orders']}, 
+            {data['total_revenue']}, {data['total_profit']}, '{max_priority}'
+        )
+        """
+        session.execute(insert_query)
+    
+    print(f"Aggregated data loaded into Gold table: {gold_channel_table}")
+except Exception as e:
+    print(f"Error aggregating by sales_channel: {e}")
+
+# Step 8: Query the gold tables to display and screenshot the results
+print("\n--- GOLD TABLE RESULTS ---")
+
+
+print("\nGold Sales by Region data:")
+gold_region_data = session.execute(f"SELECT * FROM {gold_region_table}")
+for row in gold_region_data:
+    print(row)
+
+
+print("\nGold Sales by Item Type data:")
+gold_item_data = session.execute(f"SELECT * FROM {gold_item_table}")
+for row in gold_item_data:
+    print(row)
+
+print("\nGold Sales by Channel data:")
+gold_channel_data = session.execute(f"SELECT * FROM {gold_channel_table}")
+for row in gold_channel_data:
+    print(row)
+
+
+
+# Close the connection
+cluster.shutdown()
+print("\nCassandra connection closed. Process complete!")
